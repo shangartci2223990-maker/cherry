@@ -1,0 +1,21 @@
+.env
+.env.*
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environment (Render installs from requirements.txt instead)
+venv/
+
+# Uploaded voice messages
+uploads/
+
+# Editor settings
+.vscode/
+
+# Misc
+*.log
+.DS_Store

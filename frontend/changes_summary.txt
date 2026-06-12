@@ -1,0 +1,300 @@
+AUTH & NAVIGATION BUG FIXES
+============================
+Flutter Anonymous Doctor App — Summary of all changes made.
+
+
+═══════════════════════════════════════════════════════════════
+FILE: lib/services/auth_service.dart  (NEW FILE — created from scratch)
+═══════════════════════════════════════════════════════════════
+
+WHY: The app had no single source of truth for "who is logged in."
+     Every screen was making its own navigation decisions, leading to
+     race conditions, double-navigations, and inconsistent state.
+
+WHAT IT DOES:
+  - Holds an AuthState (loading / unauthenticated / authenticated + role + wallet)
+  - On app startup, tries to restore a saved WalletConnect session
+  - When a wallet connects, asks the backend for the role (admin/doctor/patient)
+  - When a wallet disconnects, resets state to unauthenticated
+  - Exposes a logout() method that all screens call instead of doing it themselves
+
+
+═══════════════════════════════════════════════════════════════
+FILE: lib/screens/app_router.dart  (NEW FILE — created from scratch)
+═══════════════════════════════════════════════════════════════
+
+WHY: No single place was responsible for deciding which screen to show.
+     Screens were calling Navigator.pushReplacement() for login/logout,
+     which caused timing bugs and the "wrong screen appears" problems.
+
+WHAT IT DOES:
+  - Sits at the very root of the widget tree, always alive
+  - Listens to AuthService state
+  - When state is loading → shows a spinner
+  - When state is unauthenticated → shows LoginScreen
+  - When state is authenticated → shows the correct dashboard (admin/doctor/patient)
+  - No screen ever needs to call Navigator.pushReplacement for auth transitions again
+
+
+═══════════════════════════════════════════════════════════════
+FILE: lib/main.dart
+═══════════════════════════════════════════════════════════════
+
+CHANGE: Replaced LoginScreen with AppRouter as the app's home widget.
+
+  BEFORE:
+    import 'package:frontend/screens/login_screen.dart';
+    ...
+    home: const LoginScreen(),
+
+  AFTER:
+    import 'package:frontend/screens/app_router.dart';
+    ...
+    home: const AppRouter(),
+
+
+═══════════════════════════════════════════════════════════════
+FILE: lib/services/wallet_service.dart
+═══════════════════════════════════════════════════════════════
+
+CHANGE: Fixed disconnect() to null out _modal after disconnecting.
+
+WHY: The old code disconnected the WalletConnect session but left the _modal
+     object set. The next time the user tapped "Connect MetaMask", _ensureInitialized()
+     found _modal != null and skipped creating a new one — so it tried to open a
+     half-dead modal that did nothing. This was why users had to kill and reopen
+     the app to get MetaMask to respond after logging out.
+
+  BEFORE:
+    Future<void> disconnect() async {
+      await _modal?.disconnect();
+      connectedWallet.value = null;
+    }
+
+  AFTER:
+    Future<void> disconnect() async {
+      try {
+        await _modal?.disconnect();
+      } catch (_) {
+        // Ignore errors — state is reset regardless.
+      } finally {
+        _modal = null;          // <-- THE KEY FIX: forces a fresh modal on next connect
+        connectedWallet.value = null;
+      }
+    }
+
+
+═══════════════════════════════════════════════════════════════
+FILE: lib/screens/login_screen.dart
+═══════════════════════════════════════════════════════════════
+
+CHANGE: Removed all session restoration, wallet listener, role checking,
+        and navigation logic from LoginScreen.
+
+WHY: LoginScreen was doing too much — it was trying to restore sessions,
+     listen for wallet connections, check roles, and navigate. This caused
+     a race condition where tryRestoreSession() would fire after the first
+     frame, sometimes finding a stale session and bouncing the user to the
+     wrong screen, or showing the Connect MetaMask button even when already
+     logged in.
+
+  REMOVED:
+    - WalletService().connectedWallet.addListener(_onWalletConnected)
+    - WalletService().connectedWallet.removeListener(_onWalletConnected)
+    - WidgetsBinding.instance.addPostFrameCallback(() => tryRestoreSession())
+    - The entire _onWalletConnected() method (which did checkRole + Navigator.pushReplacement)
+    - The _isLoading state that was tied to role resolution
+
+  KEPT / ADDED:
+    - The Connect MetaMask button (calls WalletService().connectWallet())
+    - A simple _isConnecting flag just to prevent double-taps while the modal opens
+    - The 3 test navigation buttons (unchanged)
+
+  LoginScreen now has one job: open the wallet modal. AppRouter handles everything after.
+
+
+═══════════════════════════════════════════════════════════════
+FILE: lib/screens/patient/patient_home_screen.dart
+═══════════════════════════════════════════════════════════════
+
+CHANGE: Simplified the logout button.
+
+WHY: The old logout was calling WalletService().disconnect() and then
+     Navigator.pushReplacement() to LoginScreen. The timing between
+     disconnect completing and the new LoginScreen calling tryRestoreSession
+     caused the "logout doesn't work on first tap" bug — the session hadn't
+     fully cleared yet, so tryRestoreSession found it and bounced back.
+
+  REMOVED import:
+    import 'package:frontend/services/wallet_service.dart';
+    import 'package:frontend/screens/login_screen.dart';
+
+  ADDED import:
+    import 'package:frontend/services/auth_service.dart';
+
+  BEFORE (logout button):
+    onPressed: () async {
+      await WalletService().disconnect();
+      if (!context.mounted) return;
+      Navigator.pushReplacement(
+        context,
+        MaterialPageRoute(builder: (_) => const LoginScreen()),
+      );
+    },
+
+  AFTER (logout button):
+    onPressed: () => AuthService().logout(),
+
+
+═══════════════════════════════════════════════════════════════
+FILE: lib/screens/doctor/doctor_appointments_screen.dart
+═══════════════════════════════════════════════════════════════
+
+CHANGE: Same logout simplification as patient_home_screen.dart.
+
+  REMOVED import:
+    import 'package:frontend/services/wallet_service.dart';
+    import 'package:frontend/screens/login_screen.dart';
+
+  ADDED import:
+    import 'package:frontend/services/auth_service.dart';
+
+  BEFORE (logout button):
+    onPressed: () async {
+      await WalletService().disconnect();
+      if (!context.mounted) return;
+      Navigator.pushReplacement(
+        context,
+        MaterialPageRoute(builder: (_) => const LoginScreen()),
+      );
+    },
+
+  AFTER (logout button):
+    onPressed: () => AuthService().logout(),
+
+
+═══════════════════════════════════════════════════════════════
+FILE: lib/screens/admin/admin_dashboard_screen.dart
+═══════════════════════════════════════════════════════════════
+
+CHANGE: Same logout simplification as the other two dashboards.
+
+  REMOVED import:
+    import 'package:frontend/services/wallet_service.dart';
+    import 'package:frontend/screens/login_screen.dart';
+
+  ADDED import:
+    import 'package:frontend/services/auth_service.dart';
+
+  BEFORE (logout button):
+    onPressed: () async {
+      await WalletService().disconnect();
+      if (!context.mounted) return;
+      Navigator.pushReplacement(
+        context,
+        MaterialPageRoute(builder: (_) => const LoginScreen()),
+      );
+    },
+
+  AFTER (logout button):
+    onPressed: () => AuthService().logout(),
+
+
+═══════════════════════════════════════════════════════════════
+FILE: lib/screens/shared/chat_screen.dart
+═══════════════════════════════════════════════════════════════
+
+CHANGE: Replaced hardcoded wallet address with the real connected wallet
+        from AuthService.
+
+WHY: The chat screen had a hardcoded patient wallet address. This meant
+     every message sent by any user (doctor or patient) was attributed to
+     the same fake address. The "You" / other-person distinction in the
+     chat UI was broken for everyone except that one hardcoded address.
+
+  ADDED import:
+    import 'package:frontend/services/auth_service.dart';
+
+  BEFORE:
+    // Fake current user wallet — will come from MetaMask later.
+    final String myWallet = '0xf273cB29D47aEfA30C206f021b2Bb0e1DC27ba7c';
+
+  AFTER:
+    late final String myWallet;
+
+    @override
+    void initState() {
+      super.initState();
+      myWallet = AuthService().state.value.wallet ?? '';
+      ...
+    }
+
+
+═══════════════════════════════════════════════════════════════
+FILE: lib/screens/patient/doctor_detail_screen.dart
+═══════════════════════════════════════════════════════════════
+
+CHANGE: After a successful appointment booking, pop back to PatientHomeScreen
+        instead of pushing a standalone MyAppointmentsScreen.
+
+WHY: The old code did Navigator.pushReplacement() to a standalone
+     MyAppointmentsScreen after booking. That screen had no bottom navigation
+     tabs, so the patient was stuck on a detached screen with no way back to
+     the normal app flow. Pressing back would go to the DoctorListScreen tab,
+     but the tab bar would still be visible on PatientHomeScreen — confusing.
+
+  REMOVED import:
+    import 'package:frontend/screens/patient/my_appointments_screen.dart';
+
+  BEFORE (after successful booking):
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('Appointment booked successfully'),
+        backgroundColor: Colors.tealAccent,
+      ),
+    );
+    Navigator.pushReplacement(
+      context,
+      MaterialPageRoute(
+        builder: (_) => MyAppointmentsScreen(patientWallet: patientWallet),
+      ),
+    );
+
+  AFTER (after successful booking):
+    if (!context.mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('Booked! Go to My Appointments to view it.'),
+        backgroundColor: Colors.tealAccent,
+      ),
+    );
+    Navigator.pop(context);   // Returns to PatientHomeScreen with tabs intact
+
+
+═══════════════════════════════════════════════════════════════
+SUMMARY OF BUGS FIXED
+═══════════════════════════════════════════════════════════════
+
+1. "Connect MetaMask" button shows even when already logged in
+   → Fixed by AppRouter: it shows a spinner while checking session,
+     never shows LoginScreen until it is certain the user is not logged in.
+
+2. Sometimes goes to admin, sometimes shows wallet UI after tapping connect
+   → Fixed by removing the race condition in LoginScreen. AuthService now
+     handles session restoration before the listener is attached.
+
+3. Logout doesn't work on the first tap
+   → Fixed by removing the old Navigator.pushReplacement pattern. Logout
+     now goes through AuthService which drives AppRouter directly.
+
+4. After logout, Connect MetaMask doesn't open MetaMask — must close app
+   → Fixed by nulling _modal in WalletService.disconnect(). The next
+     connectWallet call always creates a fresh, working modal.
+
+5. Chat shows wrong "You" attribution
+   → Fixed by reading the real wallet from AuthService instead of a
+     hardcoded address.
+
+6. After booking, patient lands on a screen with no bottom navigation
+   → Fixed by popping back to PatientHomeScreen instead of pushing a
+     standalone screen.
