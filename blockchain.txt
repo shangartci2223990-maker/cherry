@@ -1,0 +1,200 @@
+// SPDX-License-Identifier: MIT
+// This is the license for your code. MIT means it is open source and anyone can use it.
+
+pragma solidity ^0.8.20;
+// This tells the compiler which version of Solidity to use.
+// ^0.8.20 means version 0.8.20 or anything newer.
+
+contract Anonymous {
+// This is your contract. Think of it like a class in any programming language.
+// Everything your contract does will live inside these curly braces.
+
+    // The admin is the owner of the platform.
+    // This address receives the platform fee on every transaction.
+    // It is set once when the contract is deployed and never changes.
+    address public admin;
+
+    // The platform takes 10% from every appointment as a fee.
+    // constant means this value can never be changed after deployment.
+    uint256 public constant PLATFORM_FEE_PERCENT = 10;
+
+    // Every appointment costs exactly 0.01 ETH.
+    // constant means this is fixed — no variable pricing for now.
+    // 0.01 ether is written as 10000000000000000 in wei (the smallest ETH unit).
+    uint256 public constant APPOINTMENT_PRICE = 0.01 ether;
+
+    // These are all the possible states an appointment can be in.
+    // None    → appointment does not exist yet
+    // Booked  → patient paid, money is held in contract, waiting for doctor
+    // Active  → doctor started the meeting, money has been released
+    // Completed → meeting ended successfully
+    // Cancelled → either patient or doctor cancelled the appointment
+    enum AppointmentStatus {
+        None,
+        Booked,
+        Active,
+        Completed,
+        Cancelled
+    }
+
+
+    // This is the blueprint for every appointment.
+    // Every time a patient books, one of these is created and stored.
+    struct Appointment {
+        // The wallet address of the patient who booked.
+        // This is their only identity — completely anonymous.
+        address patient;
+
+        // The wallet address of the doctor being booked.
+        address doctor;
+
+        // The amount of ETH paid and held in the contract.
+        uint256 amount;
+
+        // The current status of this appointment.
+        // Uses the enum we defined above.
+        AppointmentStatus status;
+
+        // Who cancelled — true means patient cancelled, false means doctor cancelled.
+        // This is how the contract knows which refund rule to apply.
+        bool cancelledByPatient;
+    }
+
+
+    // This stores all appointments.
+    // Think of it like a database table — the key is the appointment ID
+    // and the value is the Appointment struct we defined above.
+    mapping(uint256 => Appointment) public appointments;
+
+    // This is a counter that gives each appointment a unique ID.
+    // Every time a new appointment is booked, this number goes up by 1.
+    // Starts at 0 and increments with each booking.
+    uint256 public appointmentCounter;
+
+    // The constructor runs only ONCE — when the contract is deployed.
+    // It sets the admin wallet to whoever deploys the contract.
+    // msg.sender means "the wallet address that is deploying this contract right now."
+    // So whoever deploys it automatically becomes the admin.
+    constructor() {
+        admin = msg.sender;
+    }
+
+
+    // This function is called when a patient wants to book an appointment.
+    // external means it can only be called from outside the contract (from the app).
+    // payable means this function can receive ETH.
+    function bookAppointment(address _doctor) external payable {
+        
+        // Make sure the patient is sending exactly the right amount.
+        // No more, no less. The price is fixed remember.
+        require(msg.value == APPOINTMENT_PRICE, "Wrong amount sent");
+
+        // Make sure the doctor address is not empty.
+        // Someone could accidentally send a blank address.
+        require(_doctor != address(0), "Invalid doctor address");
+
+        // Increase the counter by 1 to create a new unique ID.
+        appointmentCounter++;
+
+        // Create the appointment and store it in the mapping using the new ID.
+        appointments[appointmentCounter] = Appointment({
+            patient: msg.sender,  // the wallet that is booking
+            doctor: _doctor,       // the doctor being booked
+            amount: msg.value,     // the ETH sent, now held in contract
+            status: AppointmentStatus.Booked,  // starts as Booked
+            cancelledByPatient: false  // not cancelled yet
+        });
+    }
+
+    // This function is called by the doctor when they are ready to start the meeting.
+    // This is the moment money actually moves for the first time.
+    function startMeeting(uint256 _appointmentId) external {
+
+        // Find the appointment using the ID.
+        Appointment storage appointment = appointments[_appointmentId];
+
+        // Make sure only the doctor of THIS appointment can start it.
+        // No other wallet can call this.
+        require(msg.sender == appointment.doctor, "Only the doctor can start");
+
+        // Make sure the appointment is in Booked status.
+        // You cannot start a meeting that is already active or cancelled.
+        require(appointment.status == AppointmentStatus.Booked, "Appointment is not booked");
+
+        // Calculate how much the admin gets — 10% of the total amount.
+        uint256 adminShare = (appointment.amount * PLATFORM_FEE_PERCENT) / 100;
+
+        // Calculate how much the doctor gets — the rest after admin fee.
+        uint256 doctorShare = appointment.amount - adminShare;
+
+        // Update the status to Active before sending money.
+        // Always update state BEFORE transferring money — this is a security rule in Solidity.
+        appointment.status = AppointmentStatus.Active;
+
+        // Send the admin their fee using call — safer and more modern than transfer.
+        // We check that it succeeded with require.
+        (bool adminPaid, ) = payable(admin).call{value: adminShare}("");
+        require(adminPaid, "Admin payment failed");
+
+        // Send the doctor their share using call.
+        (bool doctorPaid, ) = payable(appointment.doctor).call{value: doctorShare}("");
+        require(doctorPaid, "Doctor payment failed");
+    }
+
+    // This function is called when the PATIENT wants to cancel.
+    // Patient gets most of their money back — admin keeps a small fee as penalty.
+    function cancelByPatient(uint256 _appointmentId) external {
+
+        // Find the appointment using the ID.
+        Appointment storage appointment = appointments[_appointmentId];
+
+        // Make sure only the patient of THIS appointment can call this.
+        require(msg.sender == appointment.patient, "Only the patient can cancel");
+
+        // Can only cancel if the appointment is still Booked.
+        // Cannot cancel something already active or completed.
+        require(appointment.status == AppointmentStatus.Booked, "Cannot cancel at this stage");
+
+        // Calculate the penalty fee the admin keeps.
+        uint256 adminShare = (appointment.amount * PLATFORM_FEE_PERCENT) / 100;
+
+        // Patient gets everything back minus the penalty fee.
+        uint256 patientRefund = appointment.amount - adminShare;
+
+        // Update status before sending money — security rule.
+        appointment.status = AppointmentStatus.Cancelled;
+
+        // Send admin their penalty fee.
+        (bool adminPaid, ) = payable(admin).call{value: adminShare}("");
+        require(adminPaid, "Admin payment failed");
+
+        // Send patient their partial refund.
+        (bool patientPaid, ) = payable(appointment.patient).call{value: patientRefund}("");
+        require(patientPaid, "Refund failed");
+    }
+
+    // This function is called when the DOCTOR wants to cancel.
+    // Doctor cancelled so it is not the patient's fault — full refund, no penalty.
+    function cancelByDoctor(uint256 _appointmentId) external {
+
+        // Find the appointment using the ID.
+        Appointment storage appointment = appointments[_appointmentId];
+
+        // Make sure only the doctor of THIS appointment can call this.
+        require(msg.sender == appointment.doctor, "Only the doctor can cancel");
+
+        // Can only cancel if the appointment is still Booked.
+        require(appointment.status == AppointmentStatus.Booked, "Cannot cancel at this stage");
+
+        // Full amount goes back to the patient — no penalty at all.
+        uint256 fullRefund = appointment.amount;
+
+        // Update status before sending money — security rule.
+        appointment.status = AppointmentStatus.Cancelled;
+
+        // Send patient their full refund.
+        (bool patientPaid, ) = payable(appointment.patient).call{value: fullRefund}("");
+        require(patientPaid, "Refund failed");
+    }
+
+}
